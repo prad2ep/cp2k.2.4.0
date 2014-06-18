@@ -46,7 +46,8 @@ MODULE task_list_methods
   USE message_passing,                 ONLY: mp_allgather,&
                                              mp_alltoall,&
                                              mp_gather,&
-                                             mp_scatter
+                                             mp_scatter,&
+                                             mp_sum
   USE particle_types,                  ONLY: particle_type
   USE pw_env_types,                    ONLY: pw_env_get,&
                                              pw_env_type
@@ -952,6 +953,9 @@ CONTAINS
     INTEGER, ALLOCATABLE, DIMENSION(:, :, :) :: list_global
     LOGICAL                                  :: failure
 
+INTEGER, ALLOCATABLE, DIMENSION(:) :: load_t, load_local_sum, load_global_sum, load_tt 
+INTEGER :: ierr
+
     CALL timeset(routineN,handle)
 
     failure=.FALSE.
@@ -972,6 +976,33 @@ CONTAINS
     load_all=RESHAPE(list(2,:,:),(/maxdest*ncpu/))
     CALL mp_gather(load_all,load_per_source,0,group)
 
+!**************************************
+!Transpose load matrix
+ALLOCATE (load_t(maxdest*ncpu),STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+!TEMPRORY
+ALLOCATE (load_tt(maxdest*ncpu),STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+!END TEMPERORY
+!CALL MPI_ALLTOALL(load_all, maxdest, MPI_INT, load_t, maxdest, MPI_INT, MPI_COMM_WORLD, ierr)
+
+ALLOCATE (load_local_sum(maxdest),STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+!$$****************************************
+!****************************************
+ALLOCATE (load_global_sum(maxdest*ncpu),STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+!call mp_sum(load_all,)
+!$$****************************************
+
+!****************************************
+!Transpose load matrix
+CALL mp_alltoall(load_all, load_t, maxdest, group)
+!Compute global sum
+load_global_sum = load_all
+call mp_sum(load_global_sum, 0, group)
+!$$****************************************
+
     IF (my_pos==0) THEN
 
        ! collect the load of all CPUs
@@ -979,12 +1010,24 @@ CONTAINS
        DO icpu=1,ncpu
           load_all=load_all+load_per_source(maxdest*ncpu*(icpu-1)+1:maxdest*ncpu*icpu)
        ENDDO
+
+!****************************************
+DO icpu=1,ncpu*maxdest
+    CPPrecondition(load_global_sum(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
+ENDDO
+!$$****************************************
+
        list_global(1,:,:)=list(1,:,:)
-       list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+       !!list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+list_global(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
 
        ! optimize the fluxes
        CALL balance_global_list(list_global)
 
+
+!****************************************
+load_global_sum=RESHAPE(list_global(2,:,:),(/maxdest*ncpu/))
+!$$****************************************
        ! figure out the amount of data a given CPU can send to a destination
        !
        i=0
@@ -999,10 +1042,49 @@ CONTAINS
          ENDDO
        ENDDO
 
+!***************************************
+!DO jcpu=1,ncpu
+!    DO icpu=1,ncpu
+!        DO idest=1,maxdest
+!    CPPrecondition(list_global(2,idest,icpu)==0,cp_failure_level,routineP,error,failure)
+
+ !       ENDDO
+!    ENDDO
+!ENDDO
+!$$***************************************
+
     ENDIF
 
+!****************************************
+CALL mp_scatter(load_global_sum, load_local_sum, 0, group)
+i=1
+DO icpu=1, ncpu
+    DO idest=1,maxdest
+        itmp=MIN(load_local_sum(idest),load_t(i))
+        load_t(i)=itmp
+        load_local_sum(idest)=load_local_sum(idest)-itmp
+        i=i+1
+    ENDDO
+ENDDO
+    
+DO icpu=1,maxdest
+    !CPPrecondition(load_local_sum(icpu)==0,cp_failure_level,routineP,error,failure)
+ENDDO
+
+CALL mp_alltoall(load_t, load_tt, maxdest, group)
+!$$****************************************
+
+
     CALL mp_scatter(load_per_source,load_all,0,group)
-    list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+
+!****************************************
+DO icpu=1,ncpu*maxdest
+    CPPrecondition(load_tt(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
+ENDDO
+!$$****************************************
+
+    !!list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+list(2,:,:)=RESHAPE(load_tt,(/maxdest,ncpu/))
 
     DEALLOCATE (load_all,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
@@ -1010,6 +1092,15 @@ CONTAINS
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     DEALLOCATE (list_global,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+
+!****************************************
+DEALLOCATE (load_t,STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+DEALLOCATE (load_local_sum,STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+DEALLOCATE (load_global_sum,STAT=stat)
+CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+!$$****************************************
 
     CALL timestop(handle)
 
@@ -1048,7 +1139,14 @@ CONTAINS
     INTEGER, DIMENSION(6)                    :: options
     LOGICAL                                  :: failure
 
+!INTEGER, DIMENSION(:), POINTER :: task_load, temp_load
+!INTEGER :: mem_stat
+!INTEGER :: loop_idx1,loop_idx2
+!INTEGER :: neighbor_idx, neighbor_load
+
     CALL timeset(routineN,handle)
+
+
 
     ALLOCATE (loads(0:rs_descs(grid_level)%rs_desc%group_size-1))
     CALL get_current_loads(loads, rs_descs, grid_level, ntasks, natoms, maxset, maxpgf, &
@@ -1059,6 +1157,19 @@ CONTAINS
     maxdest=SIZE(list,2)
     ncpu=SIZE(list,3)
     natom8 =natoms
+
+!PRINT *, "===>", ncpu
+!ALLOCATE(task_load(ncpu),STAT=mem_stat)
+!CPPrecondition(mem_stat==0,cp_failure_level,routineP,error,failure)
+
+!ALLOCATE(temp_load(ncpu),STAT=mem_stat)
+!CPPrecondition(mem_stat==0,cp_failure_level,routineP,error,failure)
+
+!DO loop_idx1=1,ncpu
+!    task_load(loop_idx1) = 0
+!    temp_load(loop_idx1) = 0
+!ENDDO
+
 
     ! first find the tasks that deal with the same atom pair
     itask_stop=0
@@ -1176,6 +1287,7 @@ CONTAINS
             li=list_index(list,rank,dest)
             IF (create_list) THEN
                list(2,li,dest)=list(2,li,dest)+tasks(5,itask)
+!task_load(rank) = task_load(rank) + tasks(5, itask)
             ELSE
                IF (list(1,li,dest)==dest) THEN
                    tasks(1,itask)=encode_rank(dest, ilevel, SIZE(rs_descs))
@@ -1212,6 +1324,24 @@ CONTAINS
        ENDDO
 
     ENDDO
+
+!IF(create_list) THEN
+!        DO loop_idx1=1, ncpu
+!           DO loop_idx2=1, 7
+!             neighbor_idx  = list(1,loop_idx2,ncpu)
+!             neighbor_load = list(2,loop_idx2,ncpu)
+!             temp_load(neighbor_idx) = temp_load(neighbor_idx) + neighbor_load
+!           ENDDO
+!        ENDDO
+
+!        DO loop_idx1=1, ncpu
+!            CPPrecondition(task_load(loop_idx1) == temp_load(loop_idx1),cp_failure_level,routineP,error,failure)
+!        ENDDO
+!ENDIF
+
+!DEALLOCATE(temp_load)
+!DEALLOCATE(task_load,STAT=mem_stat)
+!CPPrecondition(mem_stat==0,cp_failure_level,routineP,error,failure)
 
     CALL timestop(handle)
 
