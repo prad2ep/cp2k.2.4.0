@@ -47,7 +47,11 @@ MODULE task_list_methods
                                              mp_alltoall,&
                                              mp_gather,&
                                              mp_scatter,&
-                                             mp_sum
+                                             mp_sum,&
+                                             mp_isend,&
+                                             mp_irecv,&
+                                             mp_waitall,&
+                                             mp_max
   USE particle_types,                  ONLY: particle_type
   USE pw_env_types,                    ONLY: pw_env_get,&
                                              pw_env_type
@@ -781,6 +785,324 @@ CONTAINS
   END SUBROUTINE load_balance_distributed
 
 
+
+!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  SUBROUTINE balance_global_list1(list_global, group, my_pos)
+  
+    INTEGER, DIMENSION(:, :, 0:)             :: list_global
+
+    INTEGER, INTENT(IN)                      :: group, my_pos
+
+    CHARACTER(LEN=*), PARAMETER :: routineN = 'balance_global_list1', &
+      routineP = moduleN//':'//routineN
+    INTEGER, PARAMETER                       :: Max_Iter = 100
+    REAL(KIND=dp), PARAMETER                 :: Tolerance_factor = 0.001_dp
+
+    INTEGER                                  :: dest, handle, icpu, idest, &
+                                                iflux, ilocal, k, maxdest, &
+                                                Ncpu, Nflux
+!    INTEGER, ALLOCATABLE, DIMENSION(:, :)    :: flux_connections
+!    LOGICAL                                  :: solution_ok, solution_optimal
+    REAL(KIND=dp)                            :: average, &
+                                                max_load_shift, tolerance
+    REAL(KIND=dp), ALLOCATABLE, DIMENSION(:) :: optimized_flux
+    REAL(KIND=dp)                            :: optimized_flux_dest
+                                                !optimized_load
+    !REAL(KIND=dp), ALLOCATABLE, &
+      !DIMENSION(:, :)                        :: flux_limits
+
+
+    TYPE PTR
+        REAL(KIND=dp), DIMENSION(:), POINTER :: ptr
+    END TYPE PTR
+
+    INTEGER                                  :: i,j,li
+    REAL(KIND=dp)                            :: load
+    REAL(KIND=dp), ALLOCATABLE, DIMENSION(:) :: load_shift
+    INTEGER, ALLOCATABLE, DIMENSION(:)       :: in_req, out_req
+    INTEGER                                  :: stat
+    LOGICAL                                  :: failure
+    TYPE(cp_error_type)                      :: error
+    REAL(KIND=dp), DIMENSION(2)              :: flux_limits
+    INTEGER                                  :: msg_out, msg_in
+    LOGICAL                                  :: snd, rcv
+    TYPE(PTR), DIMENSION(:), ALLOCATABLE     :: snd_buf, rcv_buf
+    INTEGER, DIMENSION(:,:), ALLOCATABLE     :: list_local
+
+
+    CALL timeset(routineN,handle)
+    
+    Ncpu=SIZE(list_global,3)
+    maxdest=SIZE(list_global,2)
+    !ALLOCATE (optimized_load(Ncpu),STAT=stat)
+    !CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+
+    msg_in = 0
+    msg_out= 0
+    DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF (dest<ncpu .AND. dest>my_pos) THEN
+           msg_in=msg_in+1
+           Nflux=Nflux+1
+       ENDIF
+       IF (dest<ncpu .AND. dest<my_pos) THEN
+           msg_out=msg_out+1
+       ENDIF
+    ENDDO
+
+    ALLOCATE (snd_buf(msg_out),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DO j=1,msg_out
+        ALLOCATE (snd_buf(j)%ptr(1),STAT=stat)
+        CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+        snd_buf(j)%ptr(1)=0.0_dp
+    ENDDO
+    ALLOCATE (rcv_buf(msg_in),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DO j=1,msg_in
+        ALLOCATE (rcv_buf(j)%ptr(1),STAT=stat)
+        CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+        rcv_buf(j)%ptr(1)=0.0_dp
+    ENDDO
+
+    ALLOCATE (list_local(2,maxdest),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    ALLOCATE (in_req(msg_in),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    ALLOCATE (out_req(msg_out),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    ALLOCATE (load_shift(Nflux),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    ALLOCATE (optimized_flux(Nflux),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    
+    load=SUM(list_global(2,:,my_pos))
+    average = load
+    CALL mp_sum(average, group)
+    average=average/Ncpu
+    tolerance=Tolerance_factor*average
+    
+   optimized_flux=0.0_dp
+    DO k=1,Max_iter
+    i=1
+    rcv=.FALSE.
+    DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest>my_pos) THEN
+          CALL mp_irecv(rcv_buf(i)%ptr, dest, group, in_req(i),1)
+          i=i+1
+          rcv=.TRUE.
+       ENDIF
+   ENDDO
+
+   i=1
+   snd=.FALSE.
+   !optimized_flux=0.0_dp
+   DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest<my_pos) THEN
+          snd_buf(i)%ptr(1)=load
+          CALL mp_isend(snd_buf(i)%ptr, dest, group, out_req(i),1)
+          i=i+1
+          snd=.TRUE.
+       ENDIF
+    ENDDO
+
+    IF(rcv .EQV. .TRUE.) THEN
+          CALL mp_waitall(in_req)
+    ENDIF
+
+   IF(snd .EQV. .TRUE.) THEN
+          CALL mp_waitall(out_req)
+   END IF
+
+    max_load_shift=0.0_dp
+    i=1
+    DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF (dest<ncpu .AND. dest>my_pos) THEN
+          li = list_index(list_global,my_pos,dest)
+          flux_limits(1)=-list_global(2, li, dest)
+          flux_limits(2)= list_global(2,idest,my_pos)
+          load_shift(i)=(load-rcv_buf(i)%ptr(1))/2
+          load_shift(i)=MAX(flux_limits(1)-optimized_flux(i),load_shift(i))
+          load_shift(i)=MIN(flux_limits(2)-optimized_flux(i),load_shift(i))
+          max_load_shift=MAX(ABS(load_shift(i)),max_load_shift)
+          load=load-load_shift(i)
+          optimized_flux(i)=optimized_flux(i)+load_shift(i)
+          i=i+1
+       ENDIF
+    ENDDO
+
+    i=1
+    snd=.FALSE.
+    DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest>my_pos) THEN
+          rcv_buf(i)%ptr(1)=load_shift(i)
+          CALL mp_isend(rcv_buf(i)%ptr, dest, group, in_req(i),2)
+          i=i+1
+          snd=.TRUE.
+       ENDIF
+   ENDDO
+
+   i=1
+   rcv=.FALSE.
+   DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest<my_pos) THEN
+          CALL mp_irecv(snd_buf(i)%ptr, dest, group, out_req(i),2)
+          i=i+1
+          rcv=.TRUE.
+       ENDIF
+    ENDDO
+
+    IF(rcv .EQV. .TRUE.) THEN
+          CALL mp_waitall(out_req)
+    ENDIF
+
+   IF(snd .EQV. .TRUE.) THEN
+          CALL mp_waitall(in_req)
+   END IF
+
+   DO i=1,msg_out
+     load = load + snd_buf(i)%ptr(1)
+   ENDDO
+
+   CALL mp_max(max_load_shift, group)
+   IF (max_load_shift<tolerance) THEN
+       !   solution_optimal=.TRUE.
+      EXIT
+   ENDIF
+   ENDDO
+
+   !WRITE(100+my_pos,*), "Iters ", k
+   !DO i=1,msg_in
+   !    WRITE(100+my_pos,*) optimized_flux
+   !ENDDO
+
+!if (my_pos == 0) then
+!    optimized_flux(1) = 4167.3203125000000
+!    optimized_flux(2) = 15590.339843750000
+!endif
+
+!if (my_pos == 1) then
+!    optimized_flux(1) = 21992.160156250000
+!endif
+
+!***************************
+!***************************
+     ! now adjust the load list to reflect the optimized fluxes
+     ! reorder data
+!send receive optimize_flux
+    i=1
+    snd=.FALSE.
+    DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest>my_pos) THEN
+          rcv_buf(i)%ptr(1)=optimized_flux(i)
+          CALL mp_isend(rcv_buf(i)%ptr, dest, group, in_req(i),3)
+          i=i+1
+          snd=.TRUE.
+       ENDIF
+   ENDDO
+   
+   i=1
+   rcv=.FALSE.
+   DO idest=1,maxdest
+       dest=list_global(1,idest,my_pos)
+       IF(dest<my_pos) THEN
+          CALL mp_irecv(snd_buf(i)%ptr, dest, group, out_req(i),3)
+          i=i+1
+          rcv=.TRUE.
+       ENDIF
+   ENDDO
+    
+
+    IF(rcv .EQV. .TRUE.) THEN
+          CALL mp_waitall(out_req)
+    ENDIF
+
+   IF(snd .EQV. .TRUE.) THEN
+          CALL mp_waitall(in_req)
+   END IF
+
+
+!end send receive optimize_flux
+        list_local = list_global(:,:,my_pos)
+        DO idest=1,maxdest
+           IF (list_local(1,idest)==my_pos) ilocal=idest
+        ENDDO
+
+        Nflux=0
+        j = 0
+        DO idest=1,maxdest
+           dest=list_local(1,idest)
+!           IF (dest<my_pos) THEN
+              IF (dest.NE.my_pos) THEN
+                 IF (dest>my_pos) THEN
+                    Nflux=Nflux+1
+                    IF (optimized_flux(Nflux)>0) THEN
+                       list_local(2,ilocal)=list_local(2,ilocal)+&
+                                                  list_local(2,idest)-optimized_flux(Nflux)
+                       list_local(2,idest)=optimized_flux(Nflux)
+                    ELSE
+                       list_local(2,ilocal)=list_local(2,ilocal)+&
+                                                  list_local(2,idest)
+                       list_local(2,idest)=0
+                    ENDIF
+                 ELSE
+                     j = j + 1
+                     optimized_flux_dest = snd_buf(j)%ptr(1)
+                     IF (optimized_flux_dest>0) THEN
+                         list_local(2,ilocal)=list_local(2,ilocal)+&
+                                                       list_local(2,idest)
+                         list_local(2,idest)=0
+                     ELSE
+                         list_local(2,ilocal)=list_local(2,ilocal)+&
+                                              list_local(2,idest)+optimized_flux_dest
+                             list_local(2,idest)=-optimized_flux_dest
+                    ENDIF
+                 ENDIF
+              ENDIF
+           !ENDIF
+        ENDDO    
+
+        !CALL mp_alltoall(list_local, list_global, maxdest*2, group)
+
+            !WRITE(100+my_pos,*) "list_local"
+        WRITE(100+my_pos,*) list_local
+
+!**********************************
+!*********************************
+
+    !DEALLOCATE (optimized_load,STAT=stat)
+    !CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (list_local,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (in_req,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (out_req,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (load_shift,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (optimized_flux,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (snd_buf,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (rcv_buf,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+
+
+    CALL timestop(handle)
+
+  END SUBROUTINE balance_global_list1
+!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
 ! *****************************************************************************
 !> \brief this serial routine adjusts the fluxes in the global list
 !>
@@ -846,7 +1168,7 @@ CONTAINS
                  ELSE
                     DO iflux=1,Nflux
                        IF (flux_connections(1,iflux)==dest .AND. flux_connections(2,iflux)==icpu) THEN
-                          flux_limits(1,iflux)=-list_global(2,idest,icpu)
+flux_limits(1,iflux)=-list_global(2,idest,icpu)
                           EXIT
                        ENDIF
                     ENDDO
@@ -855,6 +1177,7 @@ CONTAINS
            ENDIF
         ENDDO
      ENDDO
+
 
      solution_ok=.TRUE.
      solution_optimal=.FALSE.
@@ -867,7 +1190,6 @@ CONTAINS
      ! the maximum load normally converges even faster
      average=SUM(load)/SIZE(load)
      tolerance=Tolerance_factor*average
-
      optimized_load=load
      DO k=1,Max_iter
        max_load_shift=0.0_dp
@@ -885,9 +1207,17 @@ CONTAINS
           EXIT
        ENDIF
      ENDDO
+!*************************
+!DO iflux=1,Nflux
+! WRITE(200,*) flux_connections(1,iflux),&
+!              flux_connections(2,iflux),&
+!              optimized_flux(iflux)
+!ENDDO
+!*************************
 
      ! now adjust the load list to reflect the optimized fluxes
      ! reorder data
+
      Nflux=0
      DO icpu=0,ncpu-1
         DO idest=1,maxdest
@@ -927,7 +1257,11 @@ CONTAINS
               ENDIF
            ENDIF
         ENDDO
+!WRITE(8000,*) icpu, "=="
+!WRITE(8000,*) list_global(2,:, icpu)
      ENDDO
+!WRITE(8000,*) "************"
+!WRITE(8000,*) list_global(2,:, 0)
 
     CALL timestop(handle)
 
@@ -984,7 +1318,6 @@ CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 ALLOCATE (load_tt(maxdest*ncpu),STAT=stat)
 CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 !END TEMPERORY
-!CALL MPI_ALLTOALL(load_all, maxdest, MPI_INT, load_t, maxdest, MPI_INT, MPI_COMM_WORLD, ierr)
 
 ALLOCATE (load_local_sum(maxdest),STAT=stat)
 CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
@@ -992,7 +1325,6 @@ CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 !****************************************
 ALLOCATE (load_global_sum(maxdest*ncpu),STAT=stat)
 CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-!call mp_sum(load_all,)
 !$$****************************************
 
 !****************************************
@@ -1000,10 +1332,20 @@ CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 CALL mp_alltoall(load_all, load_t, maxdest, group)
 !Compute global sum
 load_global_sum = load_all
-call mp_sum(load_global_sum, 0, group)
+call mp_sum(load_global_sum, group)
+!$$****************************************
+
+!PHASE 2
+list_global(1,:,:)=list(1,:,:)
+list_global(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
+CALL balance_global_list1(list_global,group,my_pos)
 !$$****************************************
 
     IF (my_pos==0) THEN
+        WRITE(5000,*) list_global
+    ENDIF
+
+    IF (my_pos==5000) THEN
 
        ! collect the load of all CPUs
        load_all=0
@@ -1013,17 +1355,16 @@ call mp_sum(load_global_sum, 0, group)
 
 !****************************************
 DO icpu=1,ncpu*maxdest
-    CPPrecondition(load_global_sum(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
+    !CPPrecondition(load_global_sum(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
 ENDDO
 !$$****************************************
 
        list_global(1,:,:)=list(1,:,:)
-       !!list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
-list_global(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
+       list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+!list_global(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
 
        ! optimize the fluxes
        CALL balance_global_list(list_global)
-
 
 !****************************************
 load_global_sum=RESHAPE(list_global(2,:,:),(/maxdest*ncpu/))
@@ -1067,9 +1408,6 @@ DO icpu=1, ncpu
     ENDDO
 ENDDO
     
-DO icpu=1,maxdest
-    !CPPrecondition(load_local_sum(icpu)==0,cp_failure_level,routineP,error,failure)
-ENDDO
 
 CALL mp_alltoall(load_t, load_tt, maxdest, group)
 !$$****************************************
@@ -1079,12 +1417,12 @@ CALL mp_alltoall(load_t, load_tt, maxdest, group)
 
 !****************************************
 DO icpu=1,ncpu*maxdest
-    CPPrecondition(load_tt(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
+    !CPPrecondition(load_tt(icpu)==load_all(icpu),cp_failure_level,routineP,error,failure)    
 ENDDO
 !$$****************************************
 
-    !!list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
-list(2,:,:)=RESHAPE(load_tt,(/maxdest,ncpu/))
+     list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+!list(2,:,:)=RESHAPE(load_tt,(/maxdest,ncpu/))
 
     DEALLOCATE (load_all,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
