@@ -46,7 +46,12 @@ MODULE task_list_methods
   USE message_passing,                 ONLY: mp_allgather,&
                                              mp_alltoall,&
                                              mp_gather,&
-                                             mp_scatter
+                                             mp_scatter,&
+                                             mp_sum,&
+                                             mp_isend,&
+                                             mp_irecv,&
+                                             mp_waitall,&
+                                             mp_max
   USE particle_types,                  ONLY: particle_type
   USE pw_env_types,                    ONLY: pw_env_get,&
                                              pw_env_type
@@ -951,6 +956,9 @@ CONTAINS
     INTEGER, ALLOCATABLE, DIMENSION(:)       :: load_all, load_per_source
     INTEGER, ALLOCATABLE, DIMENSION(:, :, :) :: list_global
     LOGICAL                                  :: failure
+    
+
+INTEGER, ALLOCATABLE, DIMENSION(:) :: load_t, load_global_sum, list_local
 
     CALL timeset(routineN,handle)
 
@@ -958,9 +966,11 @@ CONTAINS
 
     ncpu=SIZE(list,3)
     maxdest=SIZE(list,2)
+ALLOCATE(load_global_sum(maxdest*ncpu))
 
     ALLOCATE (load_all(maxdest*ncpu),STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+ALLOCATE (load_t(maxdest*ncpu),STAT=stat)
     !
     ! XXXXX this allocation can cause an out-of-memory if the number of MPI tasks is sufficient
     !
@@ -968,22 +978,45 @@ CONTAINS
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     ALLOCATE (list_global(2,maxdest,ncpu),STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    ALLOCATE (list_local(maxdest),STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 
     load_all=RESHAPE(list(2,:,:),(/maxdest*ncpu/))
-    CALL mp_gather(load_all,load_per_source,0,group)
+CALL mp_gather(load_all,load_per_source,0,group)
+load_global_sum=load_all
 
+    CALL mp_alltoall(load_all, load_t, maxdest, group)
+    CALL mp_sum(load_all,group)
+    list_global(1,:,:)=list(1,:,:)
+    list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+    !CALL balance_global_list_distributed(list_global)
+
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
     IF (my_pos==0) THEN
 
        ! collect the load of all CPUs
-       load_all=0
-       DO icpu=1,ncpu
-          load_all=load_all+load_per_source(maxdest*ncpu*(icpu-1)+1:maxdest*ncpu*icpu)
-       ENDDO
+       !load_all=0
+!**********
+load_global_sum=0
+DO icpu=1,ncpu
+load_global_sum=load_global_sum+load_per_source(maxdest*ncpu*(icpu-1)+1:maxdest*ncpu*icpu)
+ENDDO
+
+!DO icpu=1,ncpu*maxdest
+! CPPrecondition(load_global_sum(icpu) == load_all(icpu), cp_failure_level,routineP,error,failure)
+!ENDDO
+!**********
+
+
        list_global(1,:,:)=list(1,:,:)
-       list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+!list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+list_global(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
 
        ! optimize the fluxes
        CALL balance_global_list(list_global)
+
+load_global_sum=RESHAPE(list_global(2,:,:), (/maxdest*ncpu/))
 
        ! figure out the amount of data a given CPU can send to a destination
        !
@@ -1000,15 +1033,44 @@ CONTAINS
        ENDDO
 
     ENDIF
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+    CALL mp_scatter(load_global_sum, list_local, 0, group)
 
-    CALL mp_scatter(load_per_source,load_all,0,group)
-    list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+    CALL mp_scatter(load_per_source,load_global_sum,0,group)
+    list(2,:,:)=RESHAPE(load_global_sum,(/maxdest,ncpu/))
+    WRITE(100+my_pos,*) list(2,:,:)
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+
+    !CALL mp_alltoall(load_all, load_all, maxdest, group)
+    !CALL mp_scatter(load_global_sum, list_local, 0, group)
+    i=0
+    DO icpu=1, ncpu
+        DO idest=1,maxdest
+            i=i+1
+            itmp=MIN(list_local(idest),load_t(i))
+            load_t(i)=itmp
+            list_local(idest)=list_local(idest)-itmp
+        ENDDO
+    ENDDO
+    CALL mp_alltoall(load_t, load_all, maxdest, group)
+
+DO icpu=1,ncpu*maxdest
+ CPPrecondition(load_global_sum(icpu) == load_all(icpu), cp_failure_level,routineP,error,failure)
+ENDDO
+list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
+WRITE(200+my_pos,*) list(2,:,:)
 
     DEALLOCATE (load_all,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     DEALLOCATE (load_per_source,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     DEALLOCATE (list_global,STAT=stat)
+    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
+    DEALLOCATE (list_local,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 
     CALL timestop(handle)
