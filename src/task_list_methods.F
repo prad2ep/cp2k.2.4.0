@@ -48,6 +48,7 @@ MODULE task_list_methods
                                              mp_gather,&
                                              mp_scatter,&
                                              mp_sum,&
+                                             mp_sum_scatter,&
                                              mp_isend,&
                                              mp_irecv,&
                                              mp_waitall,&
@@ -1265,15 +1266,13 @@ CONTAINS
     INTEGER                                  :: handle, i, icpu, idest, itmp, &
                                                 maxdest, ncpu, stat
     INTEGER, ALLOCATABLE, DIMENSION(:)       :: load_all, load_t, &
-                                                list_sum_global, list_sum_local
-    INTEGER, ALLOCATABLE, DIMENSION(:, :, :) :: list_global
+                                                load_local, rcv_cnt
     LOGICAL                                  :: failure
     INTEGER, ALLOCATABLE, DIMENSION(:, :) :: list_local
 
     CALL timeset(routineN,handle)
 
     failure=.FALSE.
-
     ncpu=SIZE(list,3)
     maxdest=SIZE(list,2)
 
@@ -1281,32 +1280,25 @@ CONTAINS
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     ALLOCATE (load_t(maxdest*ncpu),STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    ALLOCATE (list_global(2,maxdest,ncpu),STAT=stat)
-    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     ALLOCATE (list_local(2,maxdest),STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    ALLOCATE(list_sum_global(maxdest*ncpu))
+    ALLOCATE(load_local(maxdest))
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    ALLOCATE(list_sum_local(maxdest))
+    ALLOCATE(rcv_cnt(ncpu))
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 
-    load_all=RESHAPE(list(2,:,:),(/maxdest*ncpu/))
-    ! Transpose 
-    CALL mp_alltoall(load_all, load_t, maxdest, group)
+    load_all=RESHAPE(list(2,:,:),(/maxdest*ncpu/))    
     ! collect the load of all CPUs
-    CALL mp_sum(load_all,group)
-!TODO: CALL mp_sum_scatter
+    rcv_cnt = maxdest
+    CALL mp_sum_scatter(load_all, load_local, rcv_cnt, group);
 
-    list_global(1,:,:)=list(1,:,:)
-    list_global(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
-
-    !list_local(1,:)=list_global(1,:,my_pos+1)
     list_local(1,:)=list(1,:,my_pos)
-    list_local(2,:)=list_global(2,:,my_pos+1)
-
+    list_local(2,:)=load_local
     ! optimize the fluxes
     CALL balance_global_list_distributed(list_local, ncpu, group, my_pos)
 
+    ! transpose
+    CALL mp_alltoall(load_all, load_t, maxdest, group)
     !fiture out the amount of data a given CPU can send to a destination
     i=0
     DO icpu=1, ncpu
@@ -1317,7 +1309,6 @@ CONTAINS
             list_local(2,idest)=list_local(2,idest)-itmp
         ENDDO
     ENDDO
-
     !Transpose 
     CALL mp_alltoall(load_t, load_all, maxdest, group)
     list(2,:,:)=RESHAPE(load_all,(/maxdest,ncpu/))
@@ -1326,13 +1317,11 @@ CONTAINS
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     DEALLOCATE (load_t,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    DEALLOCATE (list_global,STAT=stat)
-    CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
     DEALLOCATE (list_local,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    DEALLOCATE (list_sum_local,STAT=stat)
+    DEALLOCATE (load_local,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
-    DEALLOCATE (list_sum_global,STAT=stat)
+    DEALLOCATE (rcv_cnt,STAT=stat)
     CPPrecondition(stat==0,cp_failure_level,routineP,error,failure)
 
     CALL timestop(handle)
